@@ -1,0 +1,89 @@
+name: OC Dynamic Token Connect
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # required for OIDC token request
+  contents: read
+
+jobs:
+  connect-oc:
+    name: Connect to Local OC Cluster
+    runs-on: self-hosted   # must be a runner with network access to the local OC cluster
+
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}         # e.g. https://vault.internal:8200
+      OC_API_URL: ${{ secrets.OC_API_URL }}         # e.g. https://api.crc.testing:6443
+      OC_NAMESPACE: ${{ vars.OC_NAMESPACE }}        # e.g. my-project
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Authenticate to Vault using GitHub OIDC JWT
+      #    Vault JWT auth path must be configured with the GitHub OIDC provider.
+      #    Fallback: AppRole (set USE_APPROLE=true in repo vars for non-OIDC envs)
+      # -----------------------------------------------------------------------
+      - name: Authenticate to Vault (OIDC)
+        if: ${{ vars.USE_APPROLE != 'true' }}
+        uses: hashicorp/vault-action@v3
+        id: vault-oidc
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          role: ${{ vars.VAULT_ROLE }}              # e.g. github-actions-oc
+          jwtGithubAudience: ${{ vars.VAULT_JWT_AUDIENCE }}  # e.g. https://vault.internal
+          # Vault policy for this role must allow:
+          #   path "kubernetes/creds/<role>" { capabilities = ["create", "update"] }
+          secrets: |
+            kubernetes/creds/${{ vars.OC_K8S_ROLE }} token | OC_TOKEN ;
+
+      - name: Authenticate to Vault (AppRole fallback)
+        if: ${{ vars.USE_APPROLE == 'true' }}
+        uses: hashicorp/vault-action@v3
+        id: vault-approle
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: approle
+          roleId: ${{ secrets.VAULT_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_SECRET_ID }}
+          secrets: |
+            kubernetes/creds/${{ vars.OC_K8S_ROLE }} token | OC_TOKEN ;
+
+      # -----------------------------------------------------------------------
+      # 2. Log in to the OC cluster using the dynamic short-lived token.
+      #    The token is issued by Vault's Kubernetes secrets engine with a TTL
+      #    configured at the Vault role (recommended: 15m–1h).
+      # -----------------------------------------------------------------------
+      - name: Log in to OC cluster
+        run: |
+          oc login "$OC_API_URL" \
+            --token="$OC_TOKEN" \
+            --insecure-skip-tls-verify=false
+          oc project "$OC_NAMESPACE"
+        env:
+          OC_TOKEN: ${{ env.OC_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # 3. Verify connectivity — replace with your actual deployment step
+      # -----------------------------------------------------------------------
+      - name: Verify cluster access
+        run: |
+          oc whoami
+          oc status
+
+      # -----------------------------------------------------------------------
+      # 4. Your deployment / automation step goes here
+      # -----------------------------------------------------------------------
+      # - name: Apply manifests
+      #   run: oc apply -f manifests/
+
+      # -----------------------------------------------------------------------
+      # 5. Revoke the token immediately after use (defense-in-depth)
+      #    The Vault lease will also expire at TTL, but explicit revocation
+      #    limits the window if the job is compromised mid-run.
+      # -----------------------------------------------------------------------
+      - name: Revoke OC token
+        if: always()
+        run: oc logout || true
